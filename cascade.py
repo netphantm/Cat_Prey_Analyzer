@@ -85,8 +85,9 @@ logger.setLevel(log_level)
 
 logger.addHandler(log_handler)
 
-logging.info('\n\n___##### Starting CatPreyAnalyzer #####___')
-logging.info(f"Rotating log when it grows bigger than {config.MAX_LOG_SIZE/1024/1024} MB")
+logging.info('\n\n   ##### Starting CatPreyAnalyzer #####   \n')
+logging.info('Configured logging.')
+logging.info(f"  Rotating log when it grows bigger than {config.MAX_LOG_SIZE/1024/1024} MB")
 #import surepy
 #logging.debug(f"Surepy loaded from: {surepy.__file__}")
 
@@ -230,19 +231,16 @@ class Sequential_Cascade_Feeder():
         if self.surepy_client is None:
             logging.info("🔐 Initializing Surepy client…")
             self.surepy_client = Surepy(
-                email=config.SP_EMAIL,
-                password=config.SP_PASSWORD,
+                email=SP_EMAIL,
+                password=SP_PASSWORD,
             )
         return self.surepy_client
 
     # ── Map numeric lock mode to string label ────────────────────────────────────
-    def lock_mode_to_str(self, mode: int) -> str:
-        return {
-            0: "unlock",
-            1: "lock_in",
-            2: "lock_out",
-            3: "lock",
-        }.get(mode, f"unknown({mode})")
+    def lock_mode_to_str(self, lock_state):
+        if isinstance(lock_state, LockState):
+            return lock_state.name.lower()  # "locked_in", "locked_out", etc.
+        return f"unknown({lock_state})"
 
     # ── Fetch (and cache) the Flap device object ─────────────────────────────────
     async def _fetch_device(self):
@@ -274,6 +272,9 @@ class Sequential_Cascade_Feeder():
                 logging.error("❌ No Surepy device available to read lock state.")
                 return None
 
+            logging.debug(f"Device type: {type(device)}")
+            logging.debug(f"Device methods: {dir(device)}")
+
             # In recent Surepy versions, the Flap object has `device.state` which is a LockState enum
             # (equivalent to device.raw_data()["status"]["locking"]["mode"])
             mode_enum = device.state
@@ -287,86 +288,66 @@ class Sequential_Cascade_Feeder():
 
     # ── Tell Surepy to change the lock state of the flap ─────────────────────────
     async def set_catflap_lock_state_surepy(self, mode: str) -> bool:
-        """
-        mode must be one of "unlock", "lock_in", "lock_out", or "lock".
-        """
+        lock_map = {
+            "unlock": LockState.UNLOCKED,
+            "lock_in": LockState.LOCKED_IN,
+            "lock_out": LockState.LOCKED_OUT,
+            "lock": LockState.LOCKED_ALL,
+            "unlocked": LockState.UNLOCKED,
+            "locked_in": LockState.LOCKED_IN,
+            "locked_out": LockState.LOCKED_OUT,
+            "locked_all": LockState.LOCKED_ALL
+        }
+        lock_enum = lock_map.get(mode)
+        if lock_enum is None:
+            logging.error(f"❌ Unknown lock mode: {mode}")
+            return False
+
         try:
-            client = self.get_surepy_client()
-
-            # If this version of Surepy requires explicit login:
-            try:
-                await client.login()
-            except AttributeError:
-                # Some older versions authenticate on construction
-                pass
-
-            # Map string → LockState enum
-            lock_map = {
-                "lock": LockState.LOCKED_ALL,
-                "unlock": LockState.UNLOCKED,
-                "lock_in": LockState.LOCKED_IN,
-                "lock_out": LockState.LOCKED_OUT,
-            }
-            lock_enum = lock_map.get(mode)
-            if lock_enum is None:
-                logging.error(f"❌ Unknown lock mode: {mode}")
+            device = await self._fetch_device()
+            if not device:
+                logging.error("❌ No Surepy device available to set lock state.")
                 return False
 
-            # ── First, try the client.set_lock_state(...) method if available ─────────
-            if hasattr(client, "set_lock_state"):
-                try:
-                    await client.set_lock_state(int(config.SP_DEVICE_ID), lock_enum)
-                    logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode} (via client)")
-                    return True
-                except Exception:
-                    pass
+            # ── Preferred: set_lock_state(enum) ──
+            if hasattr(device, "set_lock_state"):
+                await device.set_lock_state(lock_enum)
+                logging.info(f"✅ Surepy: catflap lock mode set to: {mode} (via device.set_lock_state)")
+                return True
 
-            # ── Otherwise, fall back to calling set_lock_state on the Flap itself ──────
-            device = await self._fetch_device()
-            if device:
-                if hasattr(device, "set_lock_state"):
-                    try:
-                        await device.set_lock_state(lock_enum)
-                        logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode} (via device)")
-                        return True
-                    except Exception:
-                        pass
+            # ── Fallbacks ──
+            if mode == "unlock" and hasattr(device, "unlock"):
+                await device.unlock()
+                logging.info("✅ Surepy: catflap unlocked (via device.unlock())")
+                return True
 
-                # ── Some newer Flap objects also expose convenience methods: unlock(), lock(), etc. ──
-                if mode == "unlock" and hasattr(device, "unlock"):
-                    try:
-                        await device.unlock()
-                        logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] unlocked (via device.unlock())")
-                        return True
-                    except Exception:
-                        pass
-                if mode == "lock" and hasattr(device, "lock"):
-                    try:
-                        await device.lock()
-                        logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] locked (via device.lock())")
-                        return True
-                    except Exception:
-                        pass
-                if mode == "lock_in" and hasattr(device, "lock_in"):
-                    try:
-                        await device.lock_in()
-                        logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock_in (via device.lock_in())")
-                        return True
-                    except Exception:
-                        pass
-                if mode == "lock_out" and hasattr(device, "lock_out"):
-                    try:
-                        await device.lock_out()
-                        logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock_out (via device.lock_out())")
-                        return True
-                    except Exception:
-                        pass
+            if mode == "lock" and hasattr(device, "lock"):
+                await device.lock()
+                logging.info("✅ Surepy: catflap locked (via device.lock())")
+                return True
 
-            logging.error(f"❌ Surepy error setting lock state [{mode}]: no supported method found.")
+            if mode == "lock_in" and hasattr(device, "lock_in"):
+                await device.lock_in()
+                logging.info("✅ Surepy: catflap locked_in (via device.lock_in())")
+                return True
+
+            if mode == "lock_out" and hasattr(device, "lock_out"):
+                await device.lock_out()
+                logging.info("✅ Surepy: catflap locked_out (via device.lock_out())")
+                return True
+
+            try:
+                await client._rest.sac.set_lock_state(int(config.SP_DEVICE_ID), lock_enum)
+                logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode} (via _rest)")
+                return True
+            except Exception as e:
+                logging.error(f"❌ Surepy _rest fallback failed to set lock: {e}")
+
+            logging.error(f"❌ No supported lock method on device for mode: {mode}")
             return False
 
         except Exception as e:
-            logging.error(f"❌ Surepy error setting lock state [{mode}]: {e}")
+            logging.error(f"❌ Error setting lock state [{mode}]: {e}")
             return False
 
     # ── HTTP GET with retries (for HA fallback) ───────────────────────────────────
