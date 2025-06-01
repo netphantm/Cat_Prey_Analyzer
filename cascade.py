@@ -237,10 +237,13 @@ class Sequential_Cascade_Feeder():
         return self.surepy_client
 
     # ── Map numeric lock mode to string label ────────────────────────────────────
-    def lock_mode_to_str(self, lock_state):
-        if isinstance(lock_state, LockState):
-            return lock_state.name.lower()  # "locked_in", "locked_out", etc.
-        return f"unknown({lock_state})"
+    def lock_mode_to_str(self, state: int) -> str:
+        return {
+            0: "unlock",
+            1: "lock_in",
+            2: "lock_out",
+            3: "lock"
+        }.get(state, f"unknown({state})")
 
     # ── Fetch (and cache) the Flap device object ─────────────────────────────────
     async def _fetch_device(self):
@@ -288,60 +291,31 @@ class Sequential_Cascade_Feeder():
 
     # ── Tell Surepy to change the lock state of the flap ─────────────────────────
     async def set_catflap_lock_state_surepy(self, mode: str) -> bool:
-        lock_map = {
-            "unlock": LockState.UNLOCKED,
-            "lock_in": LockState.LOCKED_IN,
-            "lock_out": LockState.LOCKED_OUT,
-            "lock": LockState.LOCKED_ALL,
-            "unlocked": LockState.UNLOCKED,
-            "locked_in": LockState.LOCKED_IN,
-            "locked_out": LockState.LOCKED_OUT,
-            "locked_all": LockState.LOCKED_ALL
-        }
-        lock_enum = lock_map.get(mode)
-        if lock_enum is None:
-            logging.error(f"❌ Unknown lock mode: {mode}")
-            return False
-
         try:
-            device = await self._fetch_device()
-            if not device:
-                logging.error("❌ No Surepy device available to set lock state.")
+            client = self.get_surepy_client()
+            if client is None:
+                logging.warning("⚠️ Surepy client is not initialized.")
                 return False
 
-            # ── Preferred: set_lock_state(enum) ──
-            if hasattr(device, "set_lock_state"):
-                await device.set_lock_state(lock_enum)
-                logging.info(f"✅ Surepy: catflap lock mode set to: {mode} (via device.set_lock_state)")
-                return True
+            lock_map = {
+                "lock": LockState.LOCKED_ALL,
+                "unlock": LockState.UNLOCKED,
+                "lock_in": LockState.LOCKED_IN,
+                "lock_out": LockState.LOCKED_OUT,
+            }
+            lock_enum = lock_map.get(mode)
+            if lock_enum is None:
+                logging.error(f"❌ Unknown lock mode: {mode}")
+                return False
 
-            # ── Fallbacks ──
-            if mode == "unlock" and hasattr(device, "unlock"):
-                await device.unlock()
-                logging.info("✅ Surepy: catflap unlocked (via device.unlock())")
-                return True
-
-            if mode == "lock" and hasattr(device, "lock"):
-                await device.lock()
-                logging.info("✅ Surepy: catflap locked (via device.lock())")
-                return True
-
-            if mode == "lock_in" and hasattr(device, "lock_in"):
-                await device.lock_in()
-                logging.info("✅ Surepy: catflap locked_in (via device.lock_in())")
-                return True
-
-            if mode == "lock_out" and hasattr(device, "lock_out"):
-                await device.lock_out()
-                logging.info("✅ Surepy: catflap locked_out (via device.lock_out())")
-                return True
-
-            try:
-                await client._rest.sac.set_lock_state(int(config.SP_DEVICE_ID), lock_enum)
-                logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode} (via _rest)")
-                return True
-            except Exception as e:
-                logging.error(f"❌ Surepy _rest fallback failed to set lock: {e}")
+            # Fallback: use low-level _rest.sac.set_lock_state if no other method works
+            if hasattr(client, "_rest") and hasattr(client._rest, "sac"):
+                try:
+                    await client._rest.sac.set_lock_state(int(SP_DEVICE_ID), lock_enum)
+                    logging.info(f"✅ Surepy: lock mode set via _rest fallback: {mode}")
+                    return True
+                except Exception as e:
+                    logging.error(f"❌ Surepy _rest fallback failed to set lock: {e}")
 
             logging.error(f"❌ No supported lock method on device for mode: {mode}")
             return False
