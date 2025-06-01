@@ -479,17 +479,22 @@ class Sequential_Cascade_Feeder():
     
     # ── Fetch current lock state from Surepy ──────────────────────────────────────
     async def get_catflap_state_surepy(self) -> Optional[str]:
-        device = await self._fetch_device()
-        if device:
-            try:
-                lock_state = await device.lock_state()
-                logging.info(f"🐾 Surepy catflap_state = {lock_state}")
-                return lock_state
-            except Exception as e:
-                logging.error(f"❌ Surepy error getting lock state: {e}")
+        try:
+            device = await self._fetch_device()
+            if device is None:
                 return None
-        else:
-            logging.error("❌ No Surepy device available to read lock state.")
+
+            # Instead of device.raw_data()["status"]["locking"]["mode"],
+            # just read the `state` attribute:
+            lock_state = device.state
+
+            # Map numeric state → human‐readable string
+            state_str = self.lock_mode_to_str(lock_state)
+            logging.info(f"🐾 Surepy catflap_state = {state_str}")
+            return state_str
+
+        except Exception as e:
+            logging.error(f"Surepy error while getting state: {e}")
             return None
 
     # ── Tell Surepy to change the lock state of the flap ─────────────────────────
