@@ -291,12 +291,35 @@ class Sequential_Cascade_Feeder():
 
     # ── Tell Surepy to change the lock state of the flap ─────────────────────────
     async def set_catflap_lock_state_surepy(self, mode: str) -> bool:
+        """
+        Set the catflap lock state using Surepy.
+
+        mode must be one of: "unlock", "lock_in", "lock_out", "lock"
+        """
+        logging.debug(f"🐾 Attempting to set catflap lock mode to: {mode}")
+        client = self.get_surepy_client()
+        device = await self._fetch_device()
+        lock_map = {
+            "unlock": LockState.UNLOCKED,
+            "lock_in": LockState.LOCKED_IN,
+            "lock_out": LockState.LOCKED_OUT,
+            "lock": LockState.LOCKED_ALL,
+        }
+        if mode not in lock_map:
+            logging.error(f"❌ Unknown lock mode: {mode}")
+            return False
+
         try:
-            client = self.get_surepy_client()
             if client is None:
                 logging.warning("⚠️ Surepy client is not initialized.")
                 return False
 
+            device = await self._fetch_device()
+            if not device:
+                logging.error("❌ No Surepy device available to set lock state.")
+                return False
+
+            # Updated lock map
             lock_map = {
                 "lock": LockState.LOCKED_ALL,
                 "unlock": LockState.UNLOCKED,
@@ -308,15 +331,20 @@ class Sequential_Cascade_Feeder():
                 logging.error(f"❌ Unknown lock mode: {mode}")
                 return False
 
-            # Fallback: use low-level _rest.sac.set_lock_state if no other method works
-            if hasattr(client, "_rest") and hasattr(client._rest, "sac"):
-                try:
-                    await client._rest.sac.set_lock_state(int(SP_DEVICE_ID), lock_enum)
-                    logging.info(f"✅ Surepy: lock mode set via _rest fallback: {mode}")
-                    return True
-                except Exception as e:
-                    logging.error(f"❌ Surepy _rest fallback failed to set lock: {e}")
+            logging.debug(f"Device type: {type(device)}")
+            logging.debug(f"Device methods: {dir(device)}")
 
+            # Attempt fallback via internal _rest.sac client
+            # Confirm fallback is available now that surepy is the correct version
+            if hasattr(client, "_rest") and hasattr(client._rest, "sac"):
+                await client._rest.login()
+                await client._rest.sac.set_lock_state(device.id, lock_map[mode])
+                logging.info(f"✅ Lock state set via Surepy REST fallback: {mode}")
+                return True
+            else:
+                logging.error("❌ Fallback not available: _rest.sac not found in Surepy client")
+
+            # Nothing worked
             logging.error(f"❌ No supported lock method on device for mode: {mode}")
             return False
 
@@ -995,10 +1023,10 @@ class NodeBot():
             time.sleep(1)
             bot_message = 'Rebooting in ' + str(15-i) + ' seconds...'
             self.send_text(bot_message)
-        logger.info("Telegram bot requested a reboot. Won't do that, just logging it in syslog.")
+        logging.info("Telegram bot requested a reboot. Won't do that, just logging it in syslog.")
         self.send_text('REBOOTING.. See ya later Alligator!')
         #os.system("sudo reboot") # won't do, some may call this as a service or standalone, not on a dedicated Pi..
-        os.system("logger Cat_Prey_Analyzer called a reboot")
+        os.system("Cat_Prey_Analyzer called a reboot")
 
     def bot_send_last_casc_pic(self, bot, update):
         if self.node_last_casc_img is not None:
