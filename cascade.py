@@ -192,6 +192,10 @@ class Sequential_Cascade_Feeder():
         self.device = None
         self.surepy_client: Optional[Surepy] = None
         self.device_cache = None
+        if SP_EMAIL and SP_PASSWORD:
+            self.surepy_client = Surepy(SP_EMAIL, SP_PASSWORD)
+        else:
+            self.surepy_client = None
 
     def reset_cumuli_et_al(self):
         self.EVENT_FLAG = False
