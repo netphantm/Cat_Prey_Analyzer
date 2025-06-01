@@ -448,8 +448,12 @@ class Sequential_Cascade_Feeder():
     
     # ── Fetch (and cache) the Flap device object ─────────────────────────────────
     async def _fetch_device(self):
-        if self.device_cache is not None:
+        if self.device_cache:
             return self.device_cache
+
+        if not self.surepy_client:
+            logging.warning("⚠️ Surepy client is not initialized.")
+            return None
 
         try:
             client = self.get_surepy_client()
@@ -471,33 +475,33 @@ class Sequential_Cascade_Feeder():
     
     # ── Fetch current lock state from Surepy ──────────────────────────────────────
     async def get_catflap_state_surepy(self) -> Optional[str]:
-        try:
-            device = await self._fetch_device()
-            if device is None:
+        device = await self._fetch_device()
+        if device:
+            try:
+                lock_state = await device.lock_state()
+                logging.info(f"🐾 Surepy catflap_state = {lock_state}")
+                return lock_state
+            except Exception as e:
+                logging.error(f"❌ Surepy error getting lock state: {e}")
                 return None
-
-            mode = device.raw_data().get("status", {}).get("locking", {}).get("mode")
-            state_str = self.lock_mode_to_str(mode)
-            logging.info(f"🐾 Surepy catflap_state = {state_str}")
-            return state_str
-
-        except Exception as e:
-            logging.error(f"Surepy error while getting state: {e}")
+        else:
+            logging.error("❌ No Surepy device available to read lock state.")
             return None
-    
-    
+
     # ── Tell Surepy to change the lock state of the flap ─────────────────────────
     async def set_catflap_lock_state_surepy(self, mode: str) -> bool:
         """
-        mode must be one of "unlock", "lock_in", "lock_out", "lock".
+        Set the Sure Petcare catflap lock state.
+
+        mode must be one of: "unlock", "lock_in", "lock_out", "lock".
         """
         try:
             client = self.get_surepy_client()
-            # If this version requires explicit login:
+            # Explicit login for newer versions
             try:
                 await client.login()
             except AttributeError:
-                pass  # some versions authenticate on instantiation
+                pass  # older Surepy versions login implicitly
 
             lock_map = {
                 "lock": LockState.LOCKED_ALL,
@@ -510,10 +514,49 @@ class Sequential_Cascade_Feeder():
                 logging.error(f"❌ Unknown lock mode: {mode}")
                 return False
 
-            # Always call set_lock_state on the Surepy client:
-            await client.set_lock_state(int(config.SP_DEVICE_ID), lock_enum)
-            logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode}")
-            return True
+            # ── First attempt: use client.set_lock_state ───────────────────────
+            if hasattr(client, "set_lock_state"):
+                try:
+                    await client.set_lock_state(int(config.SP_DEVICE_ID), lock_enum)
+                    logging.info(f"✅ Surepy: catflap [{config.SP_DEVICE_ID}] lock mode set to: {mode} (via client)")
+                    return True
+                except Exception as e:
+                    logging.warning(f"⚠️ Failed client.set_lock_state(): {e}")
+
+            # ── Try entity-based control ───────────────────────────────────────
+            device = await self._fetch_device()
+            if device:
+                if hasattr(device, "set_lock_state"):
+                    try:
+                        await device.set_lock_state(lock_enum)
+                        logging.info(f"✅ Surepy: catflap [{device.name}] lock mode set to: {mode} (via device)")
+                        return True
+                    except Exception as e:
+                        logging.warning(f"⚠️ device.set_lock_state failed: {e}")
+
+                # ── Fallbacks: direct methods ─────────────────────────────────
+                try:
+                    if mode == "unlock" and hasattr(device, "unlock"):
+                        await device.unlock()
+                        logging.info(f"✅ Surepy: catflap [{device.name}] unlocked (via device.unlock())")
+                        return True
+                    if mode == "lock" and hasattr(device, "lock"):
+                        await device.lock()
+                        logging.info(f"✅ Surepy: catflap [{device.name}] locked (via device.lock())")
+                        return True
+                    if mode == "lock_in" and hasattr(device, "lock_in"):
+                        await device.lock_in()
+                        logging.info(f"✅ Surepy: catflap [{device.name}] lock_in (via device.lock_in())")
+                        return True
+                    if mode == "lock_out" and hasattr(device, "lock_out"):
+                        await device.lock_out()
+                        logging.info(f"✅ Surepy: catflap [{device.name}] lock_out (via device.lock_out())")
+                        return True
+                except Exception as e:
+                    logging.warning(f"⚠️ Surepy fallback method failed: {e}")
+
+            logging.error(f"❌ Surepy error setting lock state [{mode}]: no supported method worked.")
+            return False
 
         except Exception as e:
             logging.error(f"❌ Surepy error setting lock state [{mode}]: {e}")
@@ -618,9 +661,7 @@ class Sequential_Cascade_Feeder():
         if hasattr(self, "camera"):
             with self.camera._pause_lock:
                 self.camera.pause_duration = max(0.0, float(open_time - 2))
-                logging.debug(
-                    f"Pausing camera queue for {self.camera.pause_duration:.2f}s (in open_catflap)"
-                )
+                logging.debug(f"Pausing camera queue for {self.camera.pause_duration:.2f}s (in open_catflap)")
             self.camera.pause_event.set()
 
         # Choose Surepy if configured, otherwise HA
