@@ -301,24 +301,25 @@ class Sequential_Cascade_Feeder():
         try:
             client = self.get_surepy_client()
 
-            try:
-                await client.login()
-            except AttributeError:
-                pass
-
             device = await self._fetch_device()
             if device is None:
                 logging.error("❌ Could not fetch catflap device.")
                 return False
 
-            payload = {"locking": self.mode_enum}
-            logging.debug(f"🐾 Surepy payload = {payload}")
-            logging.debug(f"🐾 Surepy device_id = {SP_DEVICE_ID}")
-            response = await self.surepy_client.sac(
-                f"/api/device/{int(SP_DEVICE_ID)}/control", method="PUT", data=payload
-            )
-            # Await the response text if needed
-            logging.debug(f"SurePetCare URL response text: {await response.text()}")
+            #payload = {"locking": self.mode_enum}
+            #logging.debug(f"🐾 Surepy payload = {payload}")
+            #logging.debug(f"🐾 Surepy device_id = {SP_DEVICE_ID}")
+            #logging.debug(f"dir(self.surepy_client) = {dir(self.surepy_client)}")
+            #logging.debug(f"self.surepy_client.sac = {self.surepy_client.sac}")
+            #logging.debug(f"dir(self.surepy_client.sac) = {dir(self.surepy_client.sac)}")
+            lock_methods = {
+                0: client.sac.unlock,
+                1: client.sac.lock_in,
+                2: client.sac.lock_out,
+                3: client.sac.lock,
+            }
+            await lock_methods[mode_enum](SP_DEVICE_ID)
+            logging.debug(f"Set lock state to mode_enum {mode_enum} via surepy.sac")
             return True
 
         except Exception as e:
