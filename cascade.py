@@ -15,7 +15,7 @@ Catflap Control Logic Summary:
   - Queries HA state via `try_get_with_retries()`.
   - Unlocks/relocks via HA webhooks using `try_post_with_retries()`.
 
-- Main Entry Point: `open_catflap(open_time)`
+- Main Entry Point: `control_catflap(open_time)`
   - Chooses Surepy or HA based on config.
   - If flap is locked ("lock_out" or "lock"), unlocks temporarily, then relocks to original mode.
   - Camera queue is paused for the duration of the flap open time (minus 2s for mechanism).
@@ -24,10 +24,29 @@ Catflap Control Logic Summary:
 - Logging:
   - Info-level logs for state changes and actions.
   - Warnings and errors for retries, exceptions, and fallbacks.
+# Determine if using SurePetCare catflap control
+HA_REQUIRED_ATTRS_HA = ["HA_UNLOCK_WEBHOOK", "HA_LOCK_OUT_WEBHOOK", "HA_LOCK_ALL_WEBHOOK", "HA_REST_URL"]
+HA_REQUIRED_ATTRS_SP = ["SP_EMAIL", "SP_PASSWORD", "SP_DEVICE_ID"]
+if all(hasattr(config, attr) for attr in HA_REQUIRED_ATTRS_HA) or all(hasattr(config, attr) for attr in HA_REQUIRED_ATTRS_SP):
+    USE_SUREPET = True
+else:
+    USE_SUREPET = False
+
+        # Choose Surepy if configured, otherwise HA
+        if use_surepy():
+            try:
+                asyncio.run(surepy_flow())
+            except Exception as e:
+                logging.error(f"Unexpected error in surepy_flow: {e}\nFalling back to HA flow.")
+                self.ha_flow()
+        else:
+            self.ha_flow()
+
 """
 
-import logging
+import config
 import sys, gzip, shutil, os, cv2, time, csv, telegram, requests, argparse, asyncio, aiohttp, pydantic, pprint, json, jwt, subprocess
+import logging
 from logging.handlers import RotatingFileHandler
 import numpy as np
 from pathlib import Path
@@ -37,15 +56,14 @@ from threading import Event, Lock, Thread
 from multiprocessing import Process
 from telegram.ext import Updater, CommandHandler
 import xml.etree.ElementTree as ET
-import config
 from io import BytesIO
 from typing import Optional, List
+from model_stages import PC_Stage, FF_Stage, Eye_Stage, Haar_Stage, CC_MobileNet_Stage
+from camera_class import Camera
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "surepy"))
 from surepy import Surepy
 from surepy.enums import LockState
 from surepy.entities.devices import Flap
-from model_stages import PC_Stage, FF_Stage, Eye_Stage, Haar_Stage, CC_MobileNet_Stage
-from camera_class import Camera
 
 # Set up argument parser
 parser = argparse.ArgumentParser(
@@ -123,73 +141,71 @@ logging.info(f"  Rotating log when it grows bigger than {config.MAX_LOG_SIZE/102
 if CAMERA_URL:
     logging.info("Using following CAMERA_URL: %s", CAMERA_URL)
 
-# Determine if using home assistant catflap control
-USE_HA = False
-
-# Getting surepy confjg
-#SP_TOKEN = getattr(config, "SP_TOKEN", str)
-SP_EMAIL = getattr(config, "SP_EMAIL", str)
-SP_PASSWORD = getattr(config, "SP_PASSWORD", str)
-SP_DEVICE_ID = getattr(config, "SP_DEVICE_ID", int)
-
-# Define required HA config attributes
-HA_REQUIRED_ATTRS = ["HA_UNLOCK_WEBHOOK", "HA_LOCK_OUT_WEBHOOK", "HA_LOCK_ALL_WEBHOOK", "HA_REST_URL"]
-# Check if all required attributes exist
-if all(hasattr(config, attr) for attr in HA_REQUIRED_ATTRS):
-    USE_HA = True
 cat_cam_py = str(Path(os.getcwd()).parents[0])
 logging.debug('CatCamPy: %s', cat_cam_py)
 logging.info(f"Using {config.TIMEZONE_OBJ} as timezone")
 
-class Spec_Event_Handler():
-    def __init__(self):
-        self.img_dir = os.path.join(cat_cam_py, 'CatPreyAnalyzer/debug/input')
-        self.out_dir = os.path.join(cat_cam_py, 'CatPreyAnalyzer/debug/output')
+import asyncio
 
-        self.img_list = [x for x in sorted(os.listdir(self.img_dir)) if'.jpg' in x]
-        self.base_cascade = Cascade()
+# ── Helper to know whether to try Surepy at all ──
+def use_surepy():
+    """Return True if Surepy is configured and client/ID are set."""
+    required_attrs = ["SUREPY_CLIENT", "SP_DEVICE_ID", "SP_EMAIL", "SP_PASSWORD"]
+    for attr in required_attrs:
+        if not hasattr(config, attr):
+            logging.debug(f"Surepy config missing attribute: {attr}")
+            return False
+        if getattr(config, attr) in (None, "", 0):
+            logging.debug(f"Surepy config attribute {attr} is empty or zero.")
+            return False
+    return True
 
-    def log_to_csv(self, img_event_obj):
-        csv_name = img_event_obj.img_name.split('_')[0] + '_' + img_event_obj.img_name.split('_')[1] + '.csv'
-        file_exists = os.path.isfile(os.path.join(self.out_dir, csv_name))
-        with open(os.path.join(self.out_dir, csv_name), mode='a') as csv_file:
-            headers = ['Img_Name', 'CC_Cat_Bool', 'CC_Time', 'CR_Class', 'CR_Val', 'CR_Time', 'BBS_Time', 'HAAR_Time', 'FF_BBS_Bool', 'FF_BBS_Val', 'FF_BBS_Time', 'Face_Bool', 'PC_Class', 'PC_Val', 'PC_Time', 'Total_Time']
-            writer = csv.DictWriter(csv_file, delimiter=',', lineterminator='\n', fieldnames=headers)
-            if not file_exists:
-                writer.writeheader()
+# ── Helper to know whether to try hassio at all ──
+def use_ha():
+    """Return True if all HA config attributes are set."""
+    required_attrs = ["HA_UNLOCK_WEBHOOK", "HA_LOCK_OUT_WEBHOOK", "HA_LOCK_ALL_WEBHOOK", "HA_REST_URL"]
+    for attr in required_attrs:
+        if not hasattr(config, attr):
+            logging.debug(f"HA config missing attribute: {attr}")
+            return False
+        if not getattr(config, attr):
+            logging.debug(f"HA config attribute {attr} is empty.")
+            return False
+    return True
 
-            writer.writerow({'Img_Name':img_event_obj.img_name, 'CC_Cat_Bool':img_event_obj.cc_cat_bool,
-                             'CC_Time':img_event_obj.cc_inference_time, 'CR_Class':img_event_obj.cr_class,
-                             'CR_Val':img_event_obj.cr_val, 'CR_Time':img_event_obj.cr_inference_time,
-                             'BBS_Time':img_event_obj.bbs_inference_time,
-                             'HAAR_Time':img_event_obj.haar_inference_time, 'FF_BBS_Bool':img_event_obj.ff_bbs_bool,
-                             'FF_BBS_Val':img_event_obj.ff_bbs_val, 'FF_BBS_Time':img_event_obj.ff_bbs_inference_time,
-                             'Face_Bool':img_event_obj.face_bool,
-                             'PC_Class':img_event_obj.pc_prey_class, 'PC_Val':img_event_obj.pc_prey_val,
-                             'PC_Time':img_event_obj.pc_inference_time, 'Total_Time':img_event_obj.total_inference_time})
+USE_SUREPET = True if (use_surepy() or use_ha()) else False
+logging.info(f"USE_SUREPET = {USE_SUREPET}")
+logging.info(f"use_surepy = {use_surepy}")
+logging.info(f"use_ha = {use_ha}")
 
-    def debug(self):
-        event_object_list = []
-        for event_img in sorted(self.img_list):
-            event_object_list.append(Event_Element(img_name=event_img, cc_target_img=cv2.imread(os.path.join(self.img_dir, event_img))))
+async def set_flap_lock_state_surepy(lock_state: str) -> bool:
+    """
+    Set the lock state of the cat flap using Surepy.
+    lock_state: "unlocked", "locked_in", "locked_out", or "locked_all"
+    """
+    try:
+        client = config.SUREPY_CLIENT  # should be already logged-in Surepy client
+        device_id = config.SP_DEVICE_ID
 
-        for event_obj in event_object_list:
-            start_time = time.time()
-            single_cascade = self.base_cascade.do_single_cascade(event_img_object=event_obj)
-            single_cascade.total_inference_time = sum(filter(None, [
-                single_cascade.cc_inference_time,
-                single_cascade.cr_inference_time,
-                single_cascade.bbs_inference_time,
-                single_cascade.haar_inference_time,
-                single_cascade.ff_bbs_inference_time,
-                single_cascade.ff_haar_inference_time,
-                single_cascade.pc_inference_time]))
-            logging.debug('Total Inference Time: %s', single_cascade.total_inference_time)
-            logging.debug('Total Runtime: %.2f seconds', time.time() - start_time)
+        lock_states = {
+            "unlocked": client.sac.unlock,
+            "locked_in": client.sac.lock_in,
+            "locked_out": client.sac.lock_out,
+            "locked_all": client.sac.lock,
+        }
 
-            # Write img to output dir and log csv of each event
-            cv2.imwrite(os.path.join(self.out_dir, single_cascade.img_name), single_cascade.output_img)
-            self.log_to_csv(img_event_obj=single_cascade)
+        state = lock_state.lower()
+        if state not in lock_states:
+            logging.error(f"Unknown lock state '{state}' for Surepy.")
+            return False
+
+        await lock_states[state](device_id)
+        logging.info(f"Set lock state to '{state}' via surepy.sac")
+        return True
+
+    except Exception as e:
+        logging.error(f"❌ Surepy error setting lock state [{lock_state}]: {e}")
+        return False
 
 class Sequential_Cascade_Feeder():
     def __init__(self):
@@ -221,110 +237,27 @@ class Sequential_Cascade_Feeder():
         self.camera_url = CAMERA_URL
         self.surepy_client: Optional[Surepy] = None
         self.device_cache: Optional[Flap] = None
-        if SP_EMAIL and SP_PASSWORD:
-            self.surepy_client = Surepy(SP_EMAIL, SP_PASSWORD)
-        else:
-            self.surepy_client = None
 
-    # ── Helper to know whether to try Surepy at all ──
-    def use_surepy(self) -> bool:
-        return bool(getattr(config, "SP_EMAIL", None) and
-                    getattr(config, "SP_PASSWORD", None) and
-                    getattr(config, "SP_DEVICE_ID", None))
+    def pause_camera_for(self, open_time: int):
+        if hasattr(self, "camera"):
+            with self.camera._pause_lock:
+                self.camera.pause_duration = max(0.0, float(open_time - 1))
+                logging.debug(f"Pausing camera queue for {self.camera.pause_duration:.2f}s")
+            self.camera.pause_event.set()
 
-    # ── Lazy-initialize a Surepy client ──
-    def get_surepy_client(self) -> Surepy:
-        if self.surepy_client is None:
-            logging.info("🔐 Initializing Surepy client…")
-            self.surepy_client = Surepy(
-                email=config.SP_EMAIL,
-                password=config.SP_PASSWORD
-            )
-        return self.surepy_client
-
-    # ── Map string self.mode to number ──
-    def lock_mode_to_enum(self, mode: str) -> int:
-        logging.debug(f"self.mode: {self.mode}")
-        return {
-            "unlocked": 0,
-            "locked_in": 1,
-            "locked_out": 2,
-            "locked_both": 3
-        }.get(self.mode, f"unknown({self.mode})")
-
-    # ── Fetch (and cache) the Flap device object ──
-    async def _fetch_device(self) -> Optional[Flap]:
-        try:
-            client = self.get_surepy_client()
-            devices: List = await client.get_devices()
-            target_id = str(SP_DEVICE_ID)
-            device = next((d for d in devices if str(d.id) == target_id), None)
-
-            if device is None:
-                logging.error(f"❌ Device ID {SP_DEVICE_ID} not found among Surepy devices.")
-                return None
-
-            self.device_cache = device
-            return device
-
-        except Exception as e:
-            logging.error(f"❌ Error fetching device from Surepy: {e}")
-            return None
-
-    # ── Ask Surepy for the current lock‐state string (“lock_out”, etc.) ──
-    async def get_catflap_state_surepy(self) -> Optional[str]:
-        try:
-            device = await self._fetch_device()
-            if device is None:
-                logging.error("❌ No Surepy device available to read lock state.")
-                return None
-
-            # In recent Surepy versions, the Flap object has `device.state` which is a LockState enum
-            # (equivalent to device.raw_data()["status"]["locking"]["mode"])
-            self.mode = str(device.state).lower()
-            logging.info(f"🐾 Surepy catflap_state = {self.mode}")
-            self.household_id = device.household_id
-            logging.debug(f"🐾 household_id = {self.household_id}")
-            self.mode_enum = self.lock_mode_to_enum(self.mode)
-            logging.info(f"🐾 Surepy catflap_state = {self.mode_enum}")
-            return self.mode
-
-        except Exception as e:
-            logging.error(f"Surepy error while getting state: {e}")
-            return None
-
-    # ── Tell Surepy to change the lock state of the flap ──
-    async def set_catflap_lock_state_surepy(self, mode_enum: int) -> bool:
-        """
-        # Possible lock states: 0 = unlocked, 1 = locked in, 2 = locked out, 3 = locked both
-        """
-        try:
-            client = self.get_surepy_client()
-
-            device = await self._fetch_device()
-            if device is None:
-                logging.error("❌ Could not fetch catflap device.")
-                return False
-
-            #payload = {"locking": self.mode_enum}
-            #logging.debug(f"🐾 Surepy payload = {payload}")
-            #logging.debug(f"🐾 Surepy device_id = {SP_DEVICE_ID}")
-            #logging.debug(f"dir(self.surepy_client) = {dir(self.surepy_client)}")
-            #logging.debug(f"self.surepy_client.sac = {self.surepy_client.sac}")
-            #logging.debug(f"dir(self.surepy_client.sac) = {dir(self.surepy_client.sac)}")
-            lock_methods = {
-                0: client.sac.unlock,
-                1: client.sac.lock_in,
-                2: client.sac.lock_out,
-                3: client.sac.lock,
-            }
-            await lock_methods[mode_enum](SP_DEVICE_ID)
-            logging.debug(f"Set lock state to mode_enum {mode_enum} via surepy.sac")
-            return True
-
-        except Exception as e:
-            logging.error(f"❌ Surepy error setting lock state [{self.mode_enum}]: {e}")
-            return False
+    # ── Retry wrapper for async Surepy calls ──
+    async def try_surepy_with_retries(self, coro_fn, description, retries=2, delay=2):
+        """Retry async surepy state-changing calls with retries."""
+        for attempt in range(1, retries + 1):
+            try:
+                result = await coro_fn()
+                logging.debug(f"{description} (attempt {attempt}) succeeded.")
+                return result
+            except Exception as e:
+                logging.warning(f"{description} (attempt {attempt}) failed: {e}")
+                await asyncio.sleep(delay)
+        logging.error(f"{description} failed after {retries} attempts.")
+        return False
 
     # ── HTTP GET with retries (for HA fallback) ──
     def try_get_with_retries(self, url, headers, description="", retries=2, timeout=2):
@@ -355,87 +288,176 @@ class Sequential_Cascade_Feeder():
         logging.error(f"{description} failed after {retries} attempts.")
         return False
 
-    # ── Main “open_catflap” that picks Surepy or HA fallback ──
-    def open_catflap(self, open_time: int):
-        async def surepy_flow():
-            state = await self.get_catflap_state_surepy()
-            if state is None:
-                self.bot.send_text("❌ Could not get state from Sure Petcare.")
-                return
+    # ── Home Assistant flow ──
+    def ha_flow(self, open_time: int):
+        self.pause_camera_for(open_time)
+        headers = {
+            "Authorization": f"Bearer {config.HA_REST_TOKEN}",
+            "content-type": "application/json"
+        }
+        response = self.try_get_with_retries(config.HA_REST_URL, headers, "Query HA catflap state")
+        if not response:
+            self.bot.send_text("⚠️ Could not query HA catflap state – aborting.")
+            return
 
-            # We consider “unlocked” or “locked_in” as “open” for the cat,
-            # and “lock_outed”/“locked” as effectively “closed to the cat.”
-            # Possible lock states: 0 = unlocked, 1 = locked in, 2 = locked out, 3 = locked both
-            if state in ("locked_out", "locked_both"):
-                if await self.set_catflap_lock_state_surepy("unlocked"):
-                    self.bot.send_text(f'🔓 Catflap was [{state}], unlocking for {open_time}s.')
-                    await asyncio.sleep(open_time)
-                    if await self.set_catflap_lock_state_surepy(state):
-                        self.bot.send_text(f'🔒 Catflap relocked to [{state}].')
-                    else:
-                        self.bot.send_text("⚠️ Error re-locking catflap after open period.")
+        try:
+            ha_state = response.json().get("state")
+            if not ha_state:
+                raise ValueError("No 'state' in HA response JSON")
+        except Exception as e:
+            self.bot.send_text(f"Failed to decode HA state: {e}")
+            return
+
+        open_states = {"unlocked", "locked_in"}
+        if ha_state in open_states:
+            self.bot.send_text(f'Catflap already open inwards: [{ha_state}]')
+            return
+
+        closed_states = {"locked_out", "locked_all"}
+        if ha_state in closed_states:
+            if self.try_post_with_retries(config.HA_UNLOCK_WEBHOOK, "Unlock catflap"):
+                self.bot.send_text(f'Catflap was [{ha_state}], unlocking for {open_time}s.')
+                time.sleep(open_time)
+                lock_url = (config.HA_LOCK_OUT_WEBHOOK
+                            if ha_state == "locked_out"
+                            else config.HA_LOCK_ALL_WEBHOOK)
+                if self.try_post_with_retries(lock_url, f"Re-lock catflap to [{ha_state}]"):
+                    self.bot.send_text(f'Catflap is back to previous state: [{ha_state}].')
                 else:
-                    self.bot.send_text("⚠️ Failed to unlock catflap via Sure Petcare.")
+                    self.bot.send_text("⚠️ Error re-locking HA catflap.")
             else:
-                # If it was already open (unlock or lock_in), just inform
-                self.bot.send_text(f'Catflap already open inwards: [{state}]')
-
-        def ha_flow():
-            # Query Home-Assistant sensor
-            headers = {
-                "Authorization": f"Bearer {config.HA_REST_TOKEN}",
-                "content-type": "application/json"
-            }
-            response = self.try_get_with_retries(config.HA_REST_URL, headers, "Query HA catflap state")
-            if not response:
-                self.bot.send_text("⚠️ Could not query HA catflap state – aborting.")
-                return
-            try:
-                ha_state = response.json().get("state")
-            except Exception as e:
-                self.bot.send_text(f"Failed to decode HA state: {e}")
-                return
-
-            if ha_state in {"locked_out", "locked_all"}:
-                if self.try_post_with_retries(config.HA_UNLOCK_WEBHOOK, "Unlock catflap"):
-                    self.bot.send_text(f'Catflap is [{ha_state}], unlocking for {open_time}s.')
-                    time.sleep(open_time)
-                    lock_url = (config.HA_LOCK_OUT_WEBHOOK
-                                if ha_state == "locked_out"
-                                else config.HA_LOCK_ALL_WEBHOOK)
-                    if self.try_post_with_retries(lock_url, f"Re-lock catflap to [{ha_state}]"):
-                        self.bot.send_text(f'Catflap is back to previous state: [{ha_state}].')
-                    else:
-                        self.bot.send_text("⚠️ Error re-locking HA catflap.")
-                else:
-                    self.bot.send_text("⚠️ Failed to unlock HA catflap.")
-            else:
-                self.bot.send_text(f'Catflap already open: [{ha_state}]')
-
-        # Before sending open command, pause camera queue:
-        if hasattr(self, "camera"):
-            with self.camera._pause_lock:
-                # carve out 2 seconds for “opening mechanics” and then pause the remainder
-                self.camera.pause_duration = max(0.0, float(open_time - 2))
-                logging.debug(f"Pausing camera queue for {self.camera.pause_duration:.2f}s (in open_catflap)")
-            self.camera.pause_event.set()
-
-        # Choose Surepy if configured, otherwise HA
-        if self.use_surepy():
-            try:
-                asyncio.run(surepy_flow())
-            except Exception as e:
-                logging.error(f"Unexpected error in surepy_flow: {e}\nFalling back to HA flow.")
-                ha_flow()
+                self.bot.send_text("⚠️ Failed to unlock HA catflap.")
         else:
-            ha_flow()
+            self.bot.send_text(f'⚠️ Unknown Home Assistant catflap state: [{ha_state}]')
 
-    # ──────────────────────────────────────────────────────────────────────────────
-    # End of the Surepy + HA integration block. Paste this entire section under your
-    # `class Sequential_Cascade_Feeder:` (after its __init__), replacing whatever
-    # old methods you had for open_catflap/try_get_with_retries/try_post_with_retries,
-    # get_catflap_state_surepy, set_catflap_lock_state_surepy, etc.
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ── Surepy flow ──
+    async def surepy_flow(self, open_time: int):
+        self.pause_camera_for(open_time)
+        # 1. Get flap state
+        state = await self.get_catflap_state_surepy()
+        if state is None:
+            self.bot.send_text("❌ Could not get state from Sure Petcare.")
+            return
+
+        open_states = {"unlocked", "locked_in"}
+        if state in open_states:
+            self.bot.send_text(f'Catflap already open inwards: [{state}]')
+            return
+
+        closed_states = {"locked_out", "locked_all"}
+        if state in closed_states:
+            # Try unlocking with retries
+            unlock_fn = lambda: self.set_catflap_lock_state_surepy("unlocked")
+            if await self.try_surepy_with_retries(unlock_fn, "Unlock catflap via Surepy"):
+                self.bot.send_text(f'Catflap was [{state}], unlocking for {open_time}s.')
+                await asyncio.sleep(open_time)
+                # Restore original state with retries
+                relock_fn = lambda: self.set_catflap_lock_state_surepy(state)
+                if await self.try_surepy_with_retries(relock_fn, f"Re-lock catflap to [{state}] via Surepy"):
+                    self.bot.send_text(f'Catflap is back to previous state: [{state}].')
+                else:
+                    self.bot.send_text("⚠️ Error re-locking catflap via Sure Petcare.")
+            else:
+                self.bot.send_text("⚠️ Failed to unlock catflap via Sure Petcare.")
+        else:
+            self.bot.send_text(f'⚠️ Unknown Sure Petcare catflap state: [{state}]')
+
+    def control_catflap(self, open_time: int = 30):
+        if use_surepy():
+            try:
+                result = asyncio.run(self.surepy_flow(open_time))
+                if not result and use_ha():
+                    logging.warning("Surepy failed, falling back to HA flow.")
+                    self.ha_flow(open_time)
+                elif not result:
+                    logging.error("Both Surepy and HA failed or are not configured.")
+            except Exception as e:
+                logging.error(f"Unexpected error in Surepy flow: {e}\nFalling back to HA flow.")
+                if use_ha():
+                    self.ha_flow(open_time)
+                else:
+                    logging.error("Both Surepy and HA failed or are not configured.")
+        elif use_ha():
+            self.ha_flow(open_time)
+        else:
+            logging.error("No catflap integration (Surepy or HA) configured!")
+
+    # ── Lazy-initialize a Surepy client ──
+    def get_surepy_client(self) -> Surepy:
+        if self.surepy_client is None:
+            logging.info("🔐 Initializing Surepy client…")
+            self.surepy_client = Surepy(
+                email=config.SP_EMAIL,
+                password=config.SP_PASSWORD
+            )
+        return self.surepy_client
+
+    # ── Fetch (and cache) the Flap device object ──
+    async def _fetch_device(self) -> Optional[Flap]:
+        try:
+            client = self.get_surepy_client()
+            devices: List = await client.get_devices()
+            target_id = str(config.SP_DEVICE_ID)
+            device = next((d for d in devices if str(d.id) == target_id), None)
+
+            if device is None:
+                logging.error(f"❌ Device ID {config.SP_DEVICE_ID} not found among Surepy devices.")
+                return None
+
+            self.device_cache = device
+            return device
+
+        except Exception as e:
+            logging.error(f"❌ Error fetching device from Surepy: {e}")
+            return None
+
+    # ── Ask Surepy for the current lock‐state string (“lock_out”, etc.) ──
+    async def get_catflap_state_surepy(self) -> Optional[str]:
+        try:
+            device = await self._fetch_device()
+            if device is None:
+                logging.error("❌ No Surepy device available to read lock state.")
+                return None
+
+            self.mode = str(device.state).lower()
+            logging.info(f"🐾 Surepy catflap_state = {self.mode}")
+            self.household_id = device.household_id
+            logging.debug(f"🐾 household_id = {self.household_id}")
+            return self.mode
+
+        except Exception as e:
+            logging.error(f"Surepy error while getting state: {e}")
+            return None
+
+    # ── Tell Surepy to change the lock state of the flap ──
+    async def set_catflap_lock_state_surepy(self, state: str) -> bool:
+        """Set lock state using string state, as sureha does."""
+        try:
+            client = self.get_surepy_client()
+            device = await self._fetch_device()
+            if device is None:
+                logging.error("❌ Could not fetch catflap device.")
+                return False
+
+            lock_states = {
+                "unlocked": client.sac.unlock,
+                "locked_in": client.sac.lock_in,
+                "locked_out": client.sac.lock_out,
+                "locked_all": client.sac.lock,
+            }
+
+            state = state.lower()
+            if state not in lock_states:
+                logging.error(f"Unknown lock state '{state}'")
+                return False
+
+            await lock_states[state](config.SP_DEVICE_ID)
+            logging.info(f"Set lock state to '{state}' via surepy.sac")
+            return True
+
+        except Exception as e:
+            logging.error(f"❌ Surepy error setting lock state [{state}]: {e}")
+            return False
 
     def reset_cumuli_et_al(self):
         self.EVENT_FLAG = False
@@ -560,10 +582,10 @@ class Sequential_Cascade_Feeder():
                 time.sleep(0.15)
 
             #Check if user force opens the door
-            if self.bot.node_let_in_flag and USE_HA:
+            if self.bot.node_let_in_flag and USE_SUREPET:
                 logging.info("Temporary unlocking the catflap on user's behalf.")
                 self.bot.send_text(message="Temporary unlocking the catflap on user's behalf.")
-                self.open_catflap(open_time = 30)
+                self.control_catflap(open_time = 40)
                 self.reset_cumuli_et_al()
 
     def queue_worker(self):
@@ -618,10 +640,10 @@ class Sequential_Cascade_Feeder():
                     p.start()
                     self.processing_pool.append(p)
                     #self.log_event_to_csv(event_obj=self.event_objects, queues_cumuli_in_event=self.queues_cumuli_in_event, event_nr=self.event_nr)
-                    if USE_HA:
+                    if USE_SUREPET:
                         logging.info('Cat is clean, unlocking the catflap temporarily')
                         self.bot.send_text(message='Cat is clean, unlocking the catflap temporarily')
-                        self.open_catflap(open_time = 50)
+                        self.control_catflap(open_time = 60)
                     self.reset_cumuli_et_al()
                 elif self.cumulus_points / self.face_counter < self.cumulus_prey_threshold:
                     self.PREY_FLAG = True
@@ -659,14 +681,6 @@ class Sequential_Cascade_Feeder():
             self.patience_counter += 1
         if self.patience_counter > 2 or self.face_counter > 1:
             self.PATIENCE_FLAG = True
-
-    def single_debug(self):
-        start_time = time.time()
-        target_img_name = 'dummy_img.jpg'
-        target_img = cv2.imread(os.path.join(cat_cam_py, 'CatPreyAnalyzer/readme_images/lenna_casc_Node1_001557_02_2020_05_24_09-49-35.jpg'))
-        cascade_obj = self.feed(target_img=target_img, img_name=target_img_name)[1]
-        logging.debug('Runtime: %.2f seconds', time.time() - start_time)
-        return cascade_obj
 
     def single_debug(self):
         start_time = time.time()
@@ -1051,6 +1065,56 @@ class DummyDQueue():
             main_deque.append((img_name, self.target_img))
             logging.info("Took image, que-length: %d", len(main_deque))
             time.sleep(0.4)
+
+class Spec_Event_Handler():
+    def __init__(self):
+        self.img_dir = os.path.join(cat_cam_py, 'CatPreyAnalyzer/debug/input')
+        self.out_dir = os.path.join(cat_cam_py, 'CatPreyAnalyzer/debug/output')
+
+        self.img_list = [x for x in sorted(os.listdir(self.img_dir)) if'.jpg' in x]
+        self.base_cascade = Cascade()
+
+    def log_to_csv(self, img_event_obj):
+        csv_name = img_event_obj.img_name.split('_')[0] + '_' + img_event_obj.img_name.split('_')[1] + '.csv'
+        file_exists = os.path.isfile(os.path.join(self.out_dir, csv_name))
+        with open(os.path.join(self.out_dir, csv_name), mode='a') as csv_file:
+            headers = ['Img_Name', 'CC_Cat_Bool', 'CC_Time', 'CR_Class', 'CR_Val', 'CR_Time', 'BBS_Time', 'HAAR_Time', 'FF_BBS_Bool', 'FF_BBS_Val', 'FF_BBS_Time', 'Face_Bool', 'PC_Class', 'PC_Val', 'PC_Time', 'Total_Time']
+            writer = csv.DictWriter(csv_file, delimiter=',', lineterminator='\n', fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow({'Img_Name':img_event_obj.img_name, 'CC_Cat_Bool':img_event_obj.cc_cat_bool,
+                             'CC_Time':img_event_obj.cc_inference_time, 'CR_Class':img_event_obj.cr_class,
+                             'CR_Val':img_event_obj.cr_val, 'CR_Time':img_event_obj.cr_inference_time,
+                             'BBS_Time':img_event_obj.bbs_inference_time,
+                             'HAAR_Time':img_event_obj.haar_inference_time, 'FF_BBS_Bool':img_event_obj.ff_bbs_bool,
+                             'FF_BBS_Val':img_event_obj.ff_bbs_val, 'FF_BBS_Time':img_event_obj.ff_bbs_inference_time,
+                             'Face_Bool':img_event_obj.face_bool,
+                             'PC_Class':img_event_obj.pc_prey_class, 'PC_Val':img_event_obj.pc_prey_val,
+                             'PC_Time':img_event_obj.pc_inference_time, 'Total_Time':img_event_obj.total_inference_time})
+
+    def debug(self):
+        event_object_list = []
+        for event_img in sorted(self.img_list):
+            event_object_list.append(Event_Element(img_name=event_img, cc_target_img=cv2.imread(os.path.join(self.img_dir, event_img))))
+
+        for event_obj in event_object_list:
+            start_time = time.time()
+            single_cascade = self.base_cascade.do_single_cascade(event_img_object=event_obj)
+            single_cascade.total_inference_time = sum(filter(None, [
+                single_cascade.cc_inference_time,
+                single_cascade.cr_inference_time,
+                single_cascade.bbs_inference_time,
+                single_cascade.haar_inference_time,
+                single_cascade.ff_bbs_inference_time,
+                single_cascade.ff_haar_inference_time,
+                single_cascade.pc_inference_time]))
+            logging.debug('Total Inference Time: %s', single_cascade.total_inference_time)
+            logging.debug('Total Runtime: %.2f seconds', time.time() - start_time)
+
+            # Write img to output dir and log csv of each event
+            cv2.imwrite(os.path.join(self.out_dir, single_cascade.img_name), single_cascade.output_img)
+            self.log_to_csv(img_event_obj=single_cascade)
 
 if __name__ == '__main__':
     sq_cascade = Sequential_Cascade_Feeder()
