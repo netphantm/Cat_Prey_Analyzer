@@ -261,7 +261,7 @@ class Sequential_Cascade_Feeder():
             device = next((d for d in devices if str(d.id) == target_id), None)
 
             if device is None:
-                logging.error(f"❌ Device ID {config.SP_DEVICE_ID} not found among Surepy devices.")
+                logging.error(f"❌ Device ID {SP_DEVICE_ID} not found among Surepy devices.")
                 return None
 
             self.device_cache = device
@@ -311,10 +311,14 @@ class Sequential_Cascade_Feeder():
                 logging.error("❌ Could not fetch catflap device.")
                 return False
 
-            payload = self.mode_enum
+            payload = {"locking": self.mode_enum}
             logging.debug(f"🐾 Surepy payload = {payload}")
-            response = await self.surepy_client.sac(f"/api/device/{SP_DEVICE_ID}/control", method="PUT", data=payload)
-            logging,debug(f"SurePetCare URL response text: {response.text()}")
+            logging.debug(f"🐾 Surepy device_id = {SP_DEVICE_ID}")
+            response = await self.surepy_client.sac(
+                f"/api/device/{int(SP_DEVICE_ID)}/control", method="PUT", data=payload
+            )
+            # Await the response text if needed
+            logging.debug(f"SurePetCare URL response text: {await response.text()}")
             return True
 
         except Exception as e:
