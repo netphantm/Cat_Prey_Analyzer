@@ -3,59 +3,69 @@
 Cat Prey Analyzer - Logging Setup Utility
 
 Purpose:
-    - Sets up robust, rotating logging for all processes (main and subprocesses).
-    - Ensures consistent format and log levels across modules.
+    - Enables consistent, centralized logging across all processes.
+    - Designed to work with external log rotation tools like `logrotate`.
 
 Features:
-    - Rotating log file with size and backup retention.
-    - Automatic gzip compression of rotated logs.
-    - Cleans up previous handlers to avoid duplicate logging.
-    - Configurable log level and format.
+    - Shared log file with file-level locking (via `fcntl`, Unix-only).
+    - Unified format and log levels across all modules and processes.
+    - Cleans up previous handlers to avoid duplicate log entries.
+    - Compatible with external rotation (no internal log rotation).
+    - Safe for use in multiprocess applications.
 
 Usage:
-    - Call setup_logging() at process startup (see cascade.py and camera_class.py).
-    - Logging settings (file, size, retention) are controlled via config.py.
+    - Call `setup_logging()` at process startup (e.g., in cascade.py or camera_class.py).
+    - Configure rotation with `/etc/logrotate.d/your_log_config` externally.
 
 Author:
     github.com/netphantm
 """
 
 import logging
+import fcntl
 import os
-import gzip
-import shutil
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
 
-def setup_logging(log_filename, max_log_size, backup_count, log_level_str="INFO"):
+
+class LockedFileHandler(logging.FileHandler):
+    """FileHandler with cross-process locking via fcntl (UNIX-only)."""
+    def emit(self, record):
+        try:
+            msg = self.format(record) + '\n'
+            with open(self.baseFilename, 'a') as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.write(msg)
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logging(log_filename="log/CatPreyAnalyzer.log", log_level_str="INFO"):
     """
-    Configure logging for the current process (main or subprocess):
-      - File rotation with gzip compression
-      - Level and formatting
-      - Removes all previous handlers (avoids duplicate logs)
+    Setup cross-process safe logging using LockedFileHandler.
+
+    Args:
+        log_filename (str): Full path to the log file.
+        log_level_str (str): Logging level ("DEBUG", "INFO", etc).
     """
     logger = logging.getLogger()
     while logger.hasHandlers():
         logger.removeHandler(logger.handlers[0])
 
-    log_handler = RotatingFileHandler(
-        log_filename, maxBytes=max_log_size, backupCount=backup_count
-    )
-
-    # Compress old log files after rotation
-    log_handler.namer = lambda name: name + ".gz"
-    class GzipRotator:
-        def __call__(self, source, dest):
-            with open(source, 'rb') as f_in, gzip.open(dest, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            os.remove(source)
-    log_handler.rotator = GzipRotator()
-
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s][PID %(process)d]: %(message)s',
-                                  datefmt='%x-%X')
-    log_handler.setFormatter(formatter)
-
     log_level = getattr(logging, log_level_str.upper(), None)
     if not isinstance(log_level, int):
         raise ValueError(f"Invalid log level: {log_level_str}")
+
     logger.setLevel(log_level)
-    logger.addHandler(log_handler)
+
+    handler = LockedFileHandler(log_filename)
+    formatter = logging.Formatter(
+        fmt='%(asctime)s [%(levelname)s][PID %(process)d]: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+

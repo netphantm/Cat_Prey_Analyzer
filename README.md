@@ -59,6 +59,21 @@ options:
         see 'https://pypi.org/project/python-dotenv/'.
 ```
 
+- The script uses a logging setup that enables shared logging across multiple processes with safe writes using fcntl.flock on Unix systems. If you want your logfiles rotated, you can use linux logrotate. Create a file like this `/etc/logrotate.d/CatPreyAnalyzer`:
+
+```auto
+/home/pi/CatPreyAnalyzer/log/CatPreyAnalyzer.log {
+    size 5M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 hassio hassio
+    copytruncate
+}
+```
+
 By following all these steps, you should now be greeted by your Telegram Bot at startup:
 
 <img src="/readme_images/bot_good_morning.png" alt="Telegram Bot greeting" width="400">

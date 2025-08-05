@@ -173,8 +173,6 @@ MOTION_THRESHOLD = 5000
 
 # Logging setup
 LOG_FILENAME = 'log/CatPreyAnalyzer.log'
-MAX_LOG_SIZE = 1 * 1024 * 1024  # 1 MB
-BACKUP_COUNT = 3
 
 # Define opening time for the catflap, in seconds
 OPEN_TIME = 60

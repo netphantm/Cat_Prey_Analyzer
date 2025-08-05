@@ -115,6 +115,13 @@ def main():
     )
     args = parser.parse_args()
 
+    log_level_str = args.log.upper()
+
+    setup_logging(
+        config.LOG_FILENAME,
+        log_level_str=log_level_str
+    )
+
     CAMERA_ID = args.camera_id if args.camera_id else "default"
     BACKEND = args.backend if args.backend else None
     if CAMERA_ID != "default":
@@ -125,12 +132,6 @@ def main():
         camera_ssh_key_file = config.CAMERA_SSH_KEY_FILE if hasattr(config, "CAMERA_SSH_KEY_FILE") and config.CAMERA_SSH_KEY_FILE not in (None, "", 0) else None
 
     log_level_str = args.log.upper()
-    setup_logging(
-        config.LOG_FILENAME,
-        config.MAX_LOG_SIZE,
-        config.BACKUP_COUNT,
-        log_level_str=log_level_str
-    )
     logging.info("\n\n   ##### Starting CatPreyAnalyzer #####   \n")
     logging.info("MAIN LOGGING STARTED at %s", log_level_str)
 
@@ -221,17 +222,16 @@ def main():
 
                 with suppress(Exception):
                     bot_instance.send_text("🔄 Camera process restarted due to repeated RTSP failures")
-                    if CAMERA_ID != "default":
-                        if all([camera_host, camera_ssh_username, camera_remote_command, camera_ssh_key_file]):
-                            logging.info("🔄 MAX_FRAME_FAILURES limit reached, restarting Camera over SSH")
-                            bot_instance.send_text("🔄 MAX_FRAME_FAILURES limit reached, restarting Camera over SSH")
-                            restart_camera_over_ssh(
-                                camera_host,
-                                camera_ssh_username,
-                                camera_remote_command,
-                                camera_ssh_key_file,
-                                bot=bot_instance
-                            )
+                    if CAMERA_ID != "default" and all([camera_host, camera_ssh_username, camera_remote_command, camera_ssh_key_file]):
+                        logging.info("🔄 MAX_FRAME_FAILURES limit reached, restarting Camera over SSH")
+                        bot_instance.send_text("🔄 MAX_FRAME_FAILURES limit reached, restarting Camera over SSH")
+                        restart_camera_over_ssh(
+                            camera_host,
+                            camera_ssh_username,
+                            camera_remote_command,
+                            camera_ssh_key_file,
+                            bot=bot_instance
+                        )
             else:
                 time.sleep(0.5)
 
@@ -340,12 +340,6 @@ def camera_process_entry(main_deque, camera_id, shutdown_flag, pause_event, paus
     # Ignore SIGINT in camera process to allow clean shutdown from main process
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    setup_logging(
-        config.LOG_FILENAME,
-        config.MAX_LOG_SIZE,
-        config.BACKUP_COUNT,
-        log_level_str=log_level_str
-    )
     logging.info(f"CAMERA PROC LOGGING STARTED at {log_level_str}")
 
     cam = Camera(main_deque, camera_id, shutdown_flag, pause_event=pause_event, pause_duration=pause_duration, log_level_str=log_level_str)
@@ -683,12 +677,12 @@ class Sequential_Cascade_Feeder():
         self.event_reset_counter = 0
         self.face_counter = 0
         self.PREY_FLAG = None
+        self.NO_PREY_FLAG = None
         self.cumulus_points = 0
         self.event_objects.clear()
         self.queues_cumuli_in_event.clear()
         self.main_deque[:] = []
         self.bot.node_let_in_flag = False
-        self.NO_PREY_FLAG = None
 
     def log_event_to_csv(self, event_obj, queues_cumuli_in_event, event_nr):
         csv_name = 'event_log.csv'
